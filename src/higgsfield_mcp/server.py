@@ -1,0 +1,694 @@
+"""
+Higgsfield AI MCP Server
+FastMCP server exposing Higgsfield AI capabilities to LLMs (Claude, etc.)
+"""
+import os
+import json
+import sys
+import argparse
+from pathlib import Path
+from typing import Optional
+from dotenv import load_dotenv
+from fastmcp import FastMCP
+
+if __name__ == "__main__":
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+
+try:
+    from higgsfield_mcp.core import HiggsfieldClient
+    from higgsfield_mcp.pipelines import PipelineRunner
+    from higgsfield_mcp.resources import (
+        format_styles,
+        format_motions,
+        format_characters,
+        format_history,
+        format_prompting_guide,
+    )
+except ImportError:
+    from .core import HiggsfieldClient
+    from .pipelines import PipelineRunner
+    from .resources import (
+        format_styles,
+        format_motions,
+        format_characters,
+        format_history,
+        format_prompting_guide,
+    )
+
+# ---------------------------------------------------------------------------
+# Credential resolution
+# ---------------------------------------------------------------------------
+parser = argparse.ArgumentParser(description="Higgsfield AI MCP Server")
+parser.add_argument("--api-key", type=str, help="Higgsfield API key")
+parser.add_argument("--secret", type=str, help="Higgsfield secret key")
+args, unknown = parser.parse_known_args()
+
+load_dotenv()
+
+api_key = args.api_key or os.getenv("HF_API_KEY", "")
+secret = args.secret or os.getenv("HF_SECRET", "")
+
+if not api_key or not secret:
+    api_key = api_key or "dummy-api-key-for-inspection"
+    secret = secret or "dummy-secret-for-inspection"
+    import warnings
+    warnings.warn(
+        "Missing HF_API_KEY and/or HF_SECRET. Provide via --api-key/--secret "
+        "or set HF_API_KEY/HF_SECRET environment variables.",
+        RuntimeWarning,
+    )
+
+client = HiggsfieldClient(api_key=api_key, secret=secret)
+pipelines = PipelineRunner(client)
+
+# ---------------------------------------------------------------------------
+# MCP server
+# ---------------------------------------------------------------------------
+mcp = FastMCP(
+    name="Higgsfield AI",
+    instructions="""
+    This server provides access to Higgsfield AI's cinematic-grade image and video generation.
+
+    Capabilities:
+    - Generate images from text prompts (Soul model) with style presets and character consistency
+    - Convert images to cinematic videos with motion presets (DoP model)
+    - Create talking head videos from image + audio (Speak v2 model)
+    - Upscale/enhance existing images via dedicated endpoint
+    - Full character reference CRUD (create, read, update, delete)
+    - Batch generation for queuing multiple jobs
+    - Pipeline workflows: generate_and_animate, text_to_talking_head
+    - Creative utilities: prompt guide, style extraction, motion search
+    - Browse styles, motions, characters, and generation history via resources
+    - Monitor usage stats and validate asset URLs
+
+    All generation is asynchronous — poll with get_generation_status to retrieve results.
+    Results are retained for 7 days.
+
+    For prompt engineering tips, read the higgsfield://docs/prompting resource.
+    """,
+    version="1.0.0",
+)
+
+# ===================================================================
+# TOOLS — Core Generation
+# ===================================================================
+
+@mcp.tool
+async def generate_image(
+    prompt: str,
+    quality: str = "1080p",
+    character_id: Optional[str] = None,
+    style_id: Optional[str] = None,
+    batch_size: int = 1,
+    dimensions: str = "2048x1152",
+) -> str:
+    """Generate high-quality images from text prompts using the Soul model.
+
+    Args:
+        prompt: Detailed text description of the image
+        quality: "720p" or "1080p" (default: "1080p")
+        character_id: Optional character reference ID for consistent generation
+        style_id: Optional style preset ID (browse with higgsfield://styles)
+        batch_size: Number of images to generate (1 or 4)
+        dimensions: Image dimensions, default "2048x1152"
+
+    Returns:
+        Job info with job_set_id for polling
+    """
+    try:
+        result = await client.generate_image(
+            prompt=prompt,
+            quality=quality,
+            batch_size=batch_size,
+            custom_reference_id=character_id,
+            style_id=style_id,
+            width_and_height=dimensions,
+        )
+        return json.dumps({
+            "success": True,
+            "job_set_id": result["id"],
+            "job_type": result["type"],
+            "status": "Job started — poll with get_generation_status",
+            "created_at": result.get("created_at"),
+            "jobs": result.get("jobs", []),
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+
+@mcp.tool
+async def generate_video(
+    image_url: str,
+    motion_id: str,
+    prompt: Optional[str] = None,
+    quality: str = "standard",
+) -> str:
+    """Convert an image to a 5-second cinematic video using the DoP model.
+
+    Args:
+        image_url: Publicly accessible HTTPS URL of source image
+        motion_id: Motion preset ID (browse with higgsfield://motions)
+        prompt: Optional description of the scene (auto-generated if omitted)
+        quality: "lite" (cheapest), "turbo" (2x speed), or "standard" (default)
+
+    Returns:
+        Job info with job_set_id for polling
+    """
+    try:
+        model_map = {"lite": "dop-lite", "turbo": "dop-turbo", "standard": "dop-preview"}
+        result = await client.generate_video(
+            image_url=image_url,
+            motion_id=motion_id,
+            prompt=prompt or "",
+            model=model_map.get(quality, "dop-preview"),
+        )
+        return json.dumps({
+            "success": True,
+            "job_set_id": result["id"],
+            "job_type": result["type"],
+            "status": "Job started — poll with get_generation_status",
+            "created_at": result.get("created_at"),
+            "model": model_map.get(quality, "dop-preview"),
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+
+@mcp.tool
+async def generate_talking_head(
+    image_url: str,
+    audio_url: str,
+    prompt: str,
+    quality: str = "high",
+    duration: int = 5,
+    seed: int = 42,
+) -> str:
+    """Generate a talking head video from an image + audio using Speak v2.
+
+    Args:
+        image_url: Portrait image URL (must be publicly accessible)
+        audio_url: Audio file URL in WAV format (must be publicly accessible)
+        prompt: Description of the image/scene
+        quality: "high" or "mid" (default: "high")
+        duration: Video length — 5, 10, or 15 seconds (default: 5)
+        seed: Random seed for reproducibility (1–1000000)
+
+    Returns:
+        Job info with job_set_id for polling
+    """
+    try:
+        result = await client.generate_talking_head(
+            image_url=image_url,
+            audio_url=audio_url,
+            prompt=prompt,
+            quality=quality,
+            duration=duration,
+            seed=seed,
+        )
+        return json.dumps({
+            "success": True,
+            "job_set_id": result["id"],
+            "job_type": result["type"],
+            "status": "Job started — poll with get_generation_status",
+            "duration": duration,
+            "quality": quality,
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+
+# ===================================================================
+# TOOLS — Upscale / Enhance
+# ===================================================================
+
+@mcp.tool
+async def upscale_media(
+    media_url: str,
+    model: str = "soul-pro",
+) -> str:
+    """Upscale or enhance an existing image via the dedicated Higgsfield endpoint.
+
+    If no media_url is available, use generate_image with higher quality instead.
+
+    Args:
+        media_url: Publicly accessible URL of the image to upscale
+        model: Upscale model — "soul-pro" (default, highest quality) or "nano-banana-pro"
+
+    Returns:
+        Job info with job_set_id for polling
+    """
+    try:
+        result = await client.upscale_media(media_url=media_url, model=model)
+        return json.dumps({
+            "success": True,
+            "job_set_id": result["id"],
+            "job_type": "upscale",
+            "status": "Upscale job started — poll with get_generation_status",
+            "model": model,
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+
+# ===================================================================
+# TOOLS — Batch & Pipelines
+# ===================================================================
+
+@mcp.tool
+async def batch_generate(items: list, job_type: str = "image") -> str:
+    """Queue multiple generation jobs at once.
+
+    Args:
+        items: List of dicts, each containing kwargs for the generation call.
+            For "image": {prompt, quality, character_id, style_id, ...}
+            For "video": {image_url, motion_id, prompt, quality, ...}
+            For "talking_head": {image_url, audio_url, prompt, quality, ...}
+        job_type: "image", "video", or "talking_head"
+
+    Returns:
+        List of job_set_ids or errors for each item
+    """
+    try:
+        results = await pipelines.batch_generate(items, job_type=job_type)
+        return json.dumps({"success": True, "results": results}, indent=2)
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+
+@mcp.tool
+async def generate_and_animate(
+    prompt: str,
+    motion_id: str,
+    quality: str = "1080p",
+    video_quality: str = "standard",
+    character_id: Optional[str] = None,
+    style_id: Optional[str] = None,
+) -> str:
+    """Pipeline: Generate an image from text, then animate it into a video.
+
+    Args:
+        prompt: Text description for the image
+        motion_id: Motion preset to apply
+        quality: Image quality ("720p" or "1080p")
+        video_quality: Video quality ("lite", "turbo", or "standard")
+        character_id: Optional character reference for the image
+        style_id: Optional style preset for the image
+
+    Returns:
+        Image URL and video job_set_id
+    """
+    try:
+        result = await pipelines.generate_and_animate(
+            prompt=prompt,
+            motion_id=motion_id,
+            quality=quality,
+            video_quality=video_quality,
+            character_id=character_id,
+            style_id=style_id,
+        )
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+
+@mcp.tool
+async def text_to_talking_head(
+    prompt: str,
+    audio_url: str,
+    quality: str = "1080p",
+    head_quality: str = "high",
+    duration: int = 5,
+    character_id: Optional[str] = None,
+    style_id: Optional[str] = None,
+) -> str:
+    """Pipeline: Generate an image from text, then create a talking head video.
+
+    Args:
+        prompt: Text description for the image
+        audio_url: WAV audio URL (must be publicly accessible)
+        quality: Image quality ("720p" or "1080p")
+        head_quality: Talking head quality ("high" or "mid")
+        duration: Video length — 5, 10, or 15 seconds
+        character_id: Optional character reference
+        style_id: Optional style preset
+
+    Returns:
+        Image URL and talking head job_set_id
+    """
+    try:
+        result = await pipelines.text_to_talking_head(
+            prompt=prompt,
+            audio_url=audio_url,
+            quality=quality,
+            head_quality=head_quality,
+            duration=duration,
+            character_id=character_id,
+            style_id=style_id,
+        )
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+
+# ===================================================================
+# TOOLS — Character CRUD
+# ===================================================================
+
+@mcp.tool
+async def create_character(name: str, image_urls: list) -> str:
+    """Create a reusable character reference for consistent generation.
+
+    Provide 1–5 clear face images. Costs 40 credits ($2.50).
+
+    Args:
+        name: Descriptive name for this character
+        image_urls: List of 1–5 publicly accessible image URLs
+
+    Returns:
+        Character reference with ID
+    """
+    try:
+        result = await client.create_character(name=name, image_urls=image_urls)
+        return json.dumps({
+            "success": True,
+            "character_id": result["id"],
+            "name": result["name"],
+            "status": result["status"],
+            "message": "Character creation started — poll with get_generation_status",
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+
+@mcp.tool
+async def list_characters() -> str:
+    """List all character references you have created."""
+    try:
+        result = await client.list_characters(page=1, page_size=50)
+        chars = [
+            {
+                "character_id": c["id"],
+                "name": c["name"],
+                "status": c["status"],
+                "thumbnail_url": c.get("thumbnail_url"),
+                "created_at": c["created_at"],
+            }
+            for c in result.get("items", [])
+        ]
+        return json.dumps({
+            "success": True,
+            "total": result.get("total", 0),
+            "characters": chars,
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+
+@mcp.tool
+async def update_character(character_id: str, name: Optional[str] = None, image_urls: Optional[list] = None) -> str:
+    """Update a character reference's name or source images.
+
+    Args:
+        character_id: ID of the character to update
+        name: New name (optional)
+        image_urls: New list of 1–5 image URLs (optional)
+
+    Returns:
+        Updated character info
+    """
+    try:
+        result = await client.update_character(character_id, name=name, image_urls=image_urls)
+        return json.dumps({"success": True, "character": result}, indent=2)
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+
+@mcp.tool
+async def delete_character(character_id: str) -> str:
+    """Delete a character reference permanently.
+
+    Args:
+        character_id: ID of the character to delete
+
+    Returns:
+        Confirmation of deletion
+    """
+    try:
+        result = await client.delete_character(character_id)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+
+# ===================================================================
+# TOOLS — Creative Utilities
+# ===================================================================
+
+@mcp.tool
+async def get_prompt_guide() -> str:
+    """Return the Higgsfield prompt engineering guide.
+
+    Read this resource to learn how to structure prompts for the Soul model.
+    It covers: Setting/Subject/Outfit/Lighting/Camera/Mood/Style format,
+    quality keywords, and examples for portrait, landscape, and sci-fi.
+
+    Returns:
+        Full prompt engineering guide with tips and examples
+    """
+    return format_prompting_guide()
+
+
+@mcp.tool
+async def extract_style_from_image(image_url: str) -> str:
+    """Analyze an image URL and find matching Higgsfield styles.
+
+    This returns the full list of available styles with descriptions.
+    Use your vision capabilities to compare the image against the style
+    descriptions and pick the best matching style_id.
+
+    Args:
+        image_url: URL of the reference image to analyze
+
+    Returns:
+        Available styles with IDs and descriptions for matching
+    """
+    try:
+        styles = await client.list_styles()
+    except Exception as e:
+        return json.dumps({"error": str(e), "message": "Could not fetch styles"}, indent=2)
+
+    formatted = [
+        {
+            "style_id": s["id"],
+            "name": s["name"],
+            "description": s["description"],
+            "preview_url": s.get("preview_url"),
+        }
+        for s in styles
+    ]
+
+    return json.dumps({
+        "image_url": image_url,
+        "instruction": "Use your vision capabilities to examine this image and compare against the style descriptions below. Return the style_id that best matches the visual style.",
+        "styles": formatted,
+    }, indent=2)
+
+
+@mcp.tool
+async def search_motions(query: str) -> str:
+    """Search motion presets by keyword.
+
+    Args:
+        query: Keywords like "zoom", "slow-motion", "dance", "pan"
+
+    Returns:
+        Matching motion presets
+    """
+    try:
+        motions = await client.list_motions()
+    except Exception as e:
+        return json.dumps({"error": str(e)}, indent=2)
+
+    query_lower = query.lower()
+    matches = []
+    for m in motions:
+        text = f"{m.get('name', '')} {m.get('description', '')}".lower()
+        if any(term in text for term in query_lower.split()):
+            matches.append({
+                "motion_id": m["id"],
+                "name": m["name"],
+                "description": m["description"],
+                "preview_url": m.get("preview_url"),
+                "start_end_frame": m.get("start_end_frame", False),
+            })
+
+    return json.dumps({
+        "query": query,
+        "total_matches": len(matches),
+        "motions": matches,
+        "usage": "Use motion_id parameter in generate_video tool",
+    }, indent=2)
+
+
+# ===================================================================
+# TOOLS — Monitoring & Validation
+# ===================================================================
+
+@mcp.tool
+async def get_generation_status(job_set_id: str) -> str:
+    """Check the status of an async generation job.
+
+    Statuses: queued, in_progress, completed, failed, nsfw.
+    Results are retained for 7 days.
+
+    Args:
+        job_set_id: ID returned from any generation tool
+
+    Returns:
+        Current status and results (if completed)
+    """
+    try:
+        result = await client.get_job_results(job_set_id)
+        response = {
+            "success": True,
+            "job_set_id": result["id"],
+            "type": result["type"],
+            "created_at": result["created_at"],
+            "jobs": [],
+        }
+        for job in result.get("jobs", []):
+            job_info = {"job_id": job["id"], "status": job["status"]}
+            if job.get("results"):
+                job_info["results"] = {
+                    "preview_url": job["results"]["min"]["url"],
+                    "full_quality_url": job["results"]["raw"]["url"],
+                    "type": job["results"]["raw"]["type"],
+                }
+            response["jobs"].append(job_info)
+
+        statuses = [j["status"] for j in result.get("jobs", [])]
+        if all(s == "completed" for s in statuses):
+            response["message"] = "Generation complete — download URLs above."
+        elif any(s == "failed" for s in statuses):
+            response["message"] = "One or more jobs failed."
+        elif any(s == "nsfw" for s in statuses):
+            response["message"] = "Content filter triggered — try a different prompt."
+        else:
+            response["message"] = "Still processing — check again in a few seconds."
+
+        return json.dumps(response, indent=2)
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+
+@mcp.tool
+async def get_usage_stats() -> str:
+    """Check your Higgsfield credit balance and usage stats."""
+    try:
+        result = await client.get_usage_stats()
+        balance = result.get("credits", result.get("balance", "unknown"))
+        response = {"success": True, "credits_remaining": balance, "raw": result}
+        if isinstance(balance, (int, float)) and balance < 50:
+            response["warning"] = "Low credit balance — top up at https://cloud.higgsfield.ai/credits"
+        return json.dumps(response, indent=2)
+    except Exception as e:
+        return json.dumps({
+            "success": False,
+            "error": str(e),
+            "note": "Usage stats endpoint may not be available. Check https://cloud.higgsfield.ai/credits",
+        }, indent=2)
+
+
+@mcp.tool
+async def validate_assets(urls: list, expected_type: Optional[str] = None) -> str:
+    """Validate that asset URLs are publicly accessible before sending to the API.
+
+    Checks that each URL returns a successful HTTP response and optionally
+    matches the expected content type (e.g., 'image/png', 'audio/wav').
+
+    Args:
+        urls: List of HTTPS URLs to validate
+        expected_type: Optional MIME type to check against (e.g., "image/", "audio/wav")
+
+    Returns:
+        Validation report per URL
+    """
+    results = []
+    for url in urls:
+        info = await client.validate_url(url, expected_content_type=expected_type)
+        results.append(info)
+    return json.dumps({"assets": results}, indent=2)
+
+
+# ===================================================================
+# TOOLS — Debug
+# ===================================================================
+
+@mcp.tool
+async def debug_credentials() -> str:
+    """Debug tool to verify API credentials are configured correctly."""
+    return json.dumps({
+        "api_key_configured": bool(client.headers.get("hf-api-key")),
+        "secret_configured": bool(client.headers.get("hf-secret")),
+        "api_key_preview": client.headers.get("hf-api-key", "")[:8] + "..." if client.headers.get("hf-api-key") else "NOT SET",
+        "base_url": client.base_url,
+        "headers_keys": list(client.headers.keys()),
+    }, indent=2)
+
+
+# ===================================================================
+# RESOURCES
+# ===================================================================
+
+@mcp.resource("higgsfield://styles")
+async def resource_styles() -> str:
+    """Browse all available Soul image style presets."""
+    return format_styles()
+
+
+@mcp.resource("higgsfield://styles/{category}")
+async def resource_styles_category(category: str) -> str:
+    """Browse styles filtered by category."""
+    return format_styles(category=category)
+
+
+@mcp.resource("higgsfield://motions")
+async def resource_motions() -> str:
+    """Browse all available video motion presets."""
+    return format_motions()
+
+
+@mcp.resource("higgsfield://motions/{category}")
+async def resource_motions_category(category: str) -> str:
+    """Browse motions filtered by category."""
+    return format_motions(category=category)
+
+
+@mcp.resource("higgsfield://characters")
+async def resource_characters() -> str:
+    """Browse your created character references."""
+    return format_characters()
+
+
+@mcp.resource("higgsfield://history")
+async def resource_history() -> str:
+    """Browse your recent generation history (last 20 jobs)."""
+    return format_history()
+
+
+@mcp.resource("higgsfield://docs/prompting")
+async def resource_prompting() -> str:
+    """Higgsfield AI prompt engineering guide — read this before writing prompts."""
+    return format_prompting_guide()
+
+
+# ===================================================================
+# Entry point
+# ===================================================================
+
+def main():
+    mcp.run(transport="stdio")
+
+
+if __name__ == "__main__":
+    main()

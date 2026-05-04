@@ -1,0 +1,29 @@
+[tool.poetry]
+name = "claude-higgsfield-mcp"
+version = "1.0.0"
+description = "MCP server bridging Claude with Higgsfield AI's cinematic image and video generation"
+authors = ["QalaLabs"]
+readme = "README.md"
+packages = [{include = "higgsfield_mcp", from = "src"}]
+license = "MIT"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+fastmcp = "^2.0.0"
+httpx = "^0.28.1"
+python-dotenv = "^1.0.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0.0"
+pytest-asyncio = "^0.24.0"
+
+[tool.poetry.scripts]
+higgsfield-mcp = "higgsfield_mcp.server:main"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
