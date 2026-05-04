@@ -1,0 +1,21 @@
+version: "3.8"
+
+services:
+  mcp:
+    build: .
+    container_name: higgsfield-mcp
+    restart: unless-stopped
+    env_file:
+      - .env.server
+    environment:
+      - MCP_TRANSPORT=http
+      - MCP_HOST=0.0.0.0
+      - MCP_PORT=8000
+      - MCP_PATH=/mcp
+    ports:
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

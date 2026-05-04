@@ -42,3 +42,6 @@ Thumbs.db
 # Debug
 /tmp/
 *.log
+
+# Server environment
+.env.server

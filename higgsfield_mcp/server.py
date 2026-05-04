@@ -687,7 +687,18 @@ async def resource_prompting() -> str:
 # ===================================================================
 
 def main():
-    mcp.run(transport="stdio")
+    import os as _os
+
+    transport = _os.getenv("MCP_TRANSPORT", "stdio")
+
+    if transport == "http":
+        host = _os.getenv("MCP_HOST", "0.0.0.0")
+        port = int(_os.getenv("MCP_PORT", "8000"))
+        path = _os.getenv("MCP_PATH", "/mcp")
+        print(f"Starting MCP server on {host}:{port}{path}")
+        mcp.run(transport="streamable-http", host=host, port=port, path=path)
+    else:
+        mcp.run(transport="stdio")
 
 
 if __name__ == "__main__":
