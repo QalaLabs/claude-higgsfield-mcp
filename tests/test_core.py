@@ -110,6 +110,5 @@ class TestConnection:
 
         result = await debug_credentials()
         parsed = json.loads(result)
-        assert "api_key_configured" in parsed
-        assert "secret_configured" in parsed
-        assert "base_url" in parsed
+        assert "auth_mode" in parsed
+        assert parsed["auth_mode"] == "api_key" or parsed["auth_mode"] == "clerk"

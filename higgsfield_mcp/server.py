@@ -24,6 +24,8 @@ try:
         format_history,
         format_prompting_guide,
     )
+    from higgsfield_mcp.auth import ClerkSession
+    from higgsfield_mcp.consumer import HiggsfieldConsumerClient
 except ImportError:
     from .core import HiggsfieldClient
     from .pipelines import PipelineRunner
@@ -34,32 +36,58 @@ except ImportError:
         format_history,
         format_prompting_guide,
     )
+    from .auth import ClerkSession
+    from .consumer import HiggsfieldConsumerClient
 
 # ---------------------------------------------------------------------------
-# Credential resolution
+# Credential resolution — supports API key mode AND Clerk (email/password) mode
 # ---------------------------------------------------------------------------
 parser = argparse.ArgumentParser(description="Higgsfield AI MCP Server")
-parser.add_argument("--api-key", type=str, help="Higgsfield API key")
-parser.add_argument("--secret", type=str, help="Higgsfield secret key")
+parser.add_argument("--api-key", type=str, help="Higgsfield API key (API key mode)")
+parser.add_argument("--secret", type=str, help="Higgsfield secret key (API key mode)")
+parser.add_argument("--email", type=str, help="Higgsfield account email (Clerk mode)")
+parser.add_argument("--password", type=str, help="Higgsfield account password (Clerk mode)")
 args, unknown = parser.parse_known_args()
 
 load_dotenv()
 
 api_key = args.api_key or os.getenv("HF_API_KEY", "")
 secret = args.secret or os.getenv("HF_SECRET", "")
+email = args.email or os.getenv("HF_EMAIL", "")
+password = args.password or os.getenv("HF_PASSWORD", "")
 
-if not api_key or not secret:
-    api_key = api_key or "dummy-api-key-for-inspection"
-    secret = secret or "dummy-secret-for-inspection"
-    import warnings
-    warnings.warn(
-        "Missing HF_API_KEY and/or HF_SECRET. Provide via --api-key/--secret "
-        "or set HF_API_KEY/HF_SECRET environment variables.",
-        RuntimeWarning,
-    )
-
-client = HiggsfieldClient(api_key=api_key, secret=secret)
-pipelines = PipelineRunner(client)
+# Clerk mode (email/password) takes priority when both are present
+if email and password:
+    clerk_session = ClerkSession()
+    if clerk_session.login(email, password):
+        client = None
+        consumer = HiggsfieldConsumerClient(clerk_session)
+        pipelines = None
+        auth_mode = "clerk"
+    else:
+        print("Warning: Clerk login failed. Falling back to API key mode.")
+        clerk_session = None
+        consumer = None
+        auth_mode = "fallback"
+        api_key = api_key or "dummy-api-key-for-inspection"
+        secret = secret or "dummy-secret-for-inspection"
+        client = HiggsfieldClient(api_key=api_key, secret=secret)
+        pipelines = PipelineRunner(client)
+else:
+    clerk_session = None
+    consumer = None
+    auth_mode = "api_key"
+    if not api_key or not secret:
+        api_key = api_key or "dummy-api-key-for-inspection"
+        secret = secret or "dummy-secret-for-inspection"
+        import warnings
+        warnings.warn(
+            "Missing HF_API_KEY/HF_SECRET or HF_EMAIL/HF_PASSWORD. "
+            "Provide one set via CLI args or .env file.",
+            RuntimeWarning,
+        )
+    client = HiggsfieldClient(api_key=api_key, secret=secret)
+    pipelines = PipelineRunner(client)
 
 # ---------------------------------------------------------------------------
 # MCP server
@@ -69,7 +97,11 @@ mcp = FastMCP(
     instructions="""
     This server provides access to Higgsfield AI's cinematic-grade image and video generation.
 
-    Capabilities:
+    Two auth modes supported:
+    - API key mode: Uses platform.higgsfield.ai (official API, key+secret auth)
+    - Clerk mode: Uses fnf.higgsfield.ai (consumer backend, email/password auth, more models)
+
+    API key mode capabilities:
     - Generate images from text prompts (Soul model) with style presets and character consistency
     - Convert images to cinematic videos with motion presets (DoP model)
     - Create talking head videos from image + audio (Speak v2 model)
@@ -77,9 +109,13 @@ mcp = FastMCP(
     - Full character reference CRUD (create, read, update, delete)
     - Batch generation for queuing multiple jobs
     - Pipeline workflows: generate_and_animate, text_to_talking_head
-    - Creative utilities: prompt guide, style extraction, motion search
     - Browse styles, motions, characters, and generation history via resources
     - Monitor usage stats and validate asset URLs
+
+    Clerk mode capabilities:
+    - Generate images with multiple consumer models (z-image, soul, flux-2, gpt, nano-banana-2, seedream)
+    - Generate videos with multiple models (kling3_0, veo3, sora2-video, etc.)
+    - Job polling and history
 
     All generation is asynchronous — poll with get_generation_status to retrieve results.
     Results are retained for 7 days.
@@ -90,7 +126,21 @@ mcp = FastMCP(
 )
 
 # ===================================================================
-# TOOLS — Core Generation
+# Helpers
+# ===================================================================
+
+def _require_api_mode() -> bool:
+    """Check if API key mode is active; return False if not."""
+    global client
+    return client is not None
+
+def _require_clerk_mode() -> bool:
+    """Check if Clerk mode is active; return False if not."""
+    global consumer
+    return consumer is not None
+
+# ===================================================================
+# TOOLS — Core Generation (API key mode only)
 # ===================================================================
 
 @mcp.tool
@@ -115,6 +165,8 @@ async def generate_image(
     Returns:
         Job info with job_set_id for polling
     """
+    if not client:
+        return json.dumps({"success": False, "error": "Not available in Clerk mode. Use consumer_generate_image instead."}, indent=2)
     try:
         result = await client.generate_image(
             prompt=prompt,
@@ -154,6 +206,8 @@ async def generate_video(
     Returns:
         Job info with job_set_id for polling
     """
+    if not client:
+        return json.dumps({"success": False, "error": "Not available in Clerk mode. Use consumer_generate_video instead."}, indent=2)
     try:
         model_map = {"lite": "dop-lite", "turbo": "dop-turbo", "standard": "dop-preview"}
         result = await client.generate_video(
@@ -196,6 +250,8 @@ async def generate_talking_head(
     Returns:
         Job info with job_set_id for polling
     """
+    if not client:
+        return json.dumps({"success": False, "error": "Not available in Clerk mode."}, indent=2)
     try:
         result = await client.generate_talking_head(
             image_url=image_url,
@@ -237,6 +293,8 @@ async def upscale_media(
     Returns:
         Job info with job_set_id for polling
     """
+    if not client:
+        return json.dumps({"success": False, "error": "Not available in Clerk mode."}, indent=2)
     try:
         result = await client.upscale_media(media_url=media_url, model=model)
         return json.dumps({
@@ -268,6 +326,8 @@ async def batch_generate(items: list, job_type: str = "image") -> str:
     Returns:
         List of job_set_ids or errors for each item
     """
+    if not pipelines:
+        return json.dumps({"success": False, "error": "Not available in Clerk mode."}, indent=2)
     try:
         results = await pipelines.batch_generate(items, job_type=job_type)
         return json.dumps({"success": True, "results": results}, indent=2)
@@ -297,6 +357,8 @@ async def generate_and_animate(
     Returns:
         Image URL and video job_set_id
     """
+    if not pipelines:
+        return json.dumps({"success": False, "error": "Not available in Clerk mode."}, indent=2)
     try:
         result = await pipelines.generate_and_animate(
             prompt=prompt,
@@ -335,6 +397,8 @@ async def text_to_talking_head(
     Returns:
         Image URL and talking head job_set_id
     """
+    if not pipelines:
+        return json.dumps({"success": False, "error": "Not available in Clerk mode."}, indent=2)
     try:
         result = await pipelines.text_to_talking_head(
             prompt=prompt,
@@ -367,6 +431,8 @@ async def create_character(name: str, image_urls: list) -> str:
     Returns:
         Character reference with ID
     """
+    if not client:
+        return json.dumps({"success": False, "error": "Not available in Clerk mode."}, indent=2)
     try:
         result = await client.create_character(name=name, image_urls=image_urls)
         return json.dumps({
@@ -383,6 +449,8 @@ async def create_character(name: str, image_urls: list) -> str:
 @mcp.tool
 async def list_characters() -> str:
     """List all character references you have created."""
+    if not client:
+        return json.dumps({"success": False, "error": "Not available in Clerk mode."}, indent=2)
     try:
         result = await client.list_characters(page=1, page_size=50)
         chars = [
@@ -416,6 +484,8 @@ async def update_character(character_id: str, name: Optional[str] = None, image_
     Returns:
         Updated character info
     """
+    if not client:
+        return json.dumps({"success": False, "error": "Not available in Clerk mode."}, indent=2)
     try:
         result = await client.update_character(character_id, name=name, image_urls=image_urls)
         return json.dumps({"success": True, "character": result}, indent=2)
@@ -433,6 +503,8 @@ async def delete_character(character_id: str) -> str:
     Returns:
         Confirmation of deletion
     """
+    if not client:
+        return json.dumps({"success": False, "error": "Not available in Clerk mode."}, indent=2)
     try:
         result = await client.delete_character(character_id)
         return json.dumps(result, indent=2)
@@ -547,6 +619,10 @@ async def get_generation_status(job_set_id: str) -> str:
     Returns:
         Current status and results (if completed)
     """
+    if not client:
+        if consumer:
+            return await consumer_get_status(job_set_id)
+        return json.dumps({"success": False, "error": "No API client available."}, indent=2)
     try:
         result = await client.get_job_results(job_set_id)
         response = {
@@ -584,6 +660,10 @@ async def get_generation_status(job_set_id: str) -> str:
 @mcp.tool
 async def get_usage_stats() -> str:
     """Check your Higgsfield credit balance and usage stats."""
+    if not client:
+        if consumer:
+            return await consumer_get_usage_stats()
+        return json.dumps({"success": False, "error": "No API client available."}, indent=2)
     try:
         result = await client.get_usage_stats()
         balance = result.get("credits", result.get("balance", "unknown"))
@@ -613,6 +693,8 @@ async def validate_assets(urls: list, expected_type: Optional[str] = None) -> st
     Returns:
         Validation report per URL
     """
+    if not client:
+        return json.dumps({"success": False, "error": "Not available in Clerk mode."}, indent=2)
     results = []
     for url in urls:
         info = await client.validate_url(url, expected_content_type=expected_type)
@@ -627,13 +709,223 @@ async def validate_assets(urls: list, expected_type: Optional[str] = None) -> st
 @mcp.tool
 async def debug_credentials() -> str:
     """Debug tool to verify API credentials are configured correctly."""
+    info = {"auth_mode": auth_mode}
+    if auth_mode == "api_key":
+        auth = client.headers.get("Authorization", "NOT SET")
+        info.update({
+            "auth_configured": auth != "NOT SET",
+            "auth_preview": auth[:20] + "..." if auth != "NOT SET" else "NOT SET",
+            "base_url": client.base_url,
+            "headers_keys": list(client.headers.keys()),
+        })
+    elif auth_mode == "clerk":
+        info.update({
+            "authenticated": bool(clerk_session.jwt),
+            "email": clerk_session.email,
+            "has_session_id": bool(clerk_session.session_id),
+            "jwt_preview": clerk_session.jwt[:20] + "..." if clerk_session.jwt else "NOT SET",
+            "api_base": "https://fnf.higgsfield.ai",
+        })
+    else:
+        info.update({"error": "No valid credentials configured"})
+    return json.dumps(info, indent=2)
+
+
+# ===================================================================
+# TOOLS — Clerk Mode (email/password auth via fnf.higgsfield.ai)
+# ===================================================================
+
+@mcp.tool
+async def consumer_generate_image(
+    prompt: str,
+    model: str = "z-image",
+    width: int = 1024,
+    height: int = 1024,
+    aspect_ratio: str = "1:1",
+    seed: Optional[int] = None,
+    enhance_prompt: bool = True,
+) -> str:
+    """Generate an image using the consumer API (Clerk mode). Supports multiple models.
+
+    Args:
+        prompt: Text description of the image
+        model: Model to use — "z-image" (fast, default), "soul", "flux-2", "gpt", "nano-banana-2", "seedream", "seedream-v4-5"
+        width: Image width in pixels (default: 1024)
+        height: Image height in pixels (default: 1024)
+        aspect_ratio: Aspect ratio like "1:1", "16:9", "9:16", "4:3" (default: "1:1")
+        seed: Optional random seed for reproducibility
+        enhance_prompt: Auto-enhance the prompt (default: True)
+
+    Returns:
+        Job info with job_set_id for polling
+    """
+    if not consumer:
+        return json.dumps({"success": False, "error": "Clerk mode not active. Set HF_EMAIL and HF_PASSWORD."}, indent=2)
+    try:
+        result = consumer.generate_image(
+            prompt=prompt,
+            model=model,
+            width=width,
+            height=height,
+            aspect_ratio=aspect_ratio,
+            seed=seed,
+            enhance_prompt=enhance_prompt,
+        )
+        job_set_id = result.get("id", result.get("job_sets", [{}])[0].get("id") if result.get("job_sets") else None)
+        return json.dumps({
+            "success": True,
+            "job_set_id": job_set_id,
+            "model": model,
+            "status": "Job started — poll with get_generation_status",
+            "raw": result,
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+
+@mcp.tool
+async def consumer_generate_video(
+    prompt: str,
+    model: str = "kling3_0",
+    aspect_ratio: str = "16:9",
+    duration: int = 5,
+    sound: str = "on",
+    enhance_prompt: bool = True,
+) -> str:
+    """Generate a video using the consumer API (Clerk mode). Supports multiple video models.
+
+    Args:
+        prompt: Text description of the video
+        model: Video model — "kling3_0" (default), "kling", "veo3", "wan2-5-video", "minimax-hailuo", "sora2-video", "seedance", "image2video"
+        aspect_ratio: Aspect ratio like "16:9", "9:16", "1:1" (default: "16:9")
+        duration: Video duration in seconds (default: 5)
+        sound: "on" or "off" (default: "on")
+        enhance_prompt: Auto-enhance the prompt (default: True)
+
+    Returns:
+        Job info with job_set_id for polling
+    """
+    if not consumer:
+        return json.dumps({"success": False, "error": "Clerk mode not active. Set HF_EMAIL and HF_PASSWORD."}, indent=2)
+    try:
+        result = consumer.generate_video(
+            prompt=prompt,
+            model=model,
+            aspect_ratio=aspect_ratio,
+            duration=duration,
+            sound=sound,
+            enhance_prompt=enhance_prompt,
+        )
+        job_set_id = result.get("id", result.get("job_sets", [{}])[0].get("id") if result.get("job_sets") else None)
+        return json.dumps({
+            "success": True,
+            "job_set_id": job_set_id,
+            "model": model,
+            "status": "Job started — poll with get_generation_status",
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+
+async def consumer_get_status(job_set_id: str) -> str:
+    """Poll job status on the consumer API."""
+    if not consumer:
+        return json.dumps({"success": False, "error": "Clerk mode not active."}, indent=2)
+    try:
+        result = consumer.get_job_results(job_set_id)
+        response = {
+            "success": True,
+            "job_set_id": job_set_id,
+            "status": result.get("status", "unknown"),
+            "jobs": result.get("jobs", []),
+        }
+        return json.dumps(response, indent=2)
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+
+async def consumer_get_usage_stats() -> str:
+    """Get account info and credit balance from consumer API."""
+    if not consumer:
+        return json.dumps({"success": False, "error": "Clerk mode not active."}, indent=2)
+    try:
+        info = consumer.get_account_info()
+        return json.dumps({
+            "success": True,
+            "credits": info.get("credits", "unknown"),
+            "email": clerk_session.email,
+            "raw": info,
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+
+@mcp.tool
+async def consumer_list_models() -> str:
+    """List all available image and video models for Clerk mode."""
+    from .consumer import IMAGE_MODELS, VIDEO_MODELS
     return json.dumps({
-        "api_key_configured": bool(client.headers.get("hf-api-key")),
-        "secret_configured": bool(client.headers.get("hf-secret")),
-        "api_key_preview": client.headers.get("hf-api-key", "")[:8] + "..." if client.headers.get("hf-api-key") else "NOT SET",
-        "base_url": client.base_url,
-        "headers_keys": list(client.headers.keys()),
+        "image_models": {k: v for k, v in IMAGE_MODELS.items()},
+        "video_models": {k: v for k, v in VIDEO_MODELS.items()},
     }, indent=2)
+
+
+@mcp.tool
+async def clerk_login(email: str, password: str) -> str:
+    """Login to Higgsfield with email/password (for Clerk mode).
+
+    If 2FA verification is required, call clerk_verify with the code from your email.
+
+    Args:
+        email: Higgsfield account email
+        password: Higgsfield account password
+
+    Returns:
+        Login result or verification required message
+    """
+    global clerk_session, consumer, auth_mode
+    try:
+        s = ClerkSession()
+        if s.login(email, password):
+            clerk_session = s
+            consumer = HiggsfieldConsumerClient(s)
+            auth_mode = "clerk"
+            return json.dumps({"success": True, "email": email, "message": "Logged in successfully"}, indent=2)
+
+        # Check if verification is needed
+        if s.session_id:
+            clerk_session = s
+            return json.dumps({
+                "success": True,
+                "verification_required": True,
+                "message": "Verification code sent to your email. Call clerk_verify with the 6-digit code.",
+            }, indent=2)
+        return json.dumps({"success": False, "error": "Login failed"}, indent=2)
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+
+@mcp.tool
+async def clerk_verify(code: str) -> str:
+    """Complete email verification for Clerk login.
+
+    Args:
+        code: 6-digit verification code from email
+
+    Returns:
+        Login result
+    """
+    global clerk_session, consumer, auth_mode
+    if not clerk_session:
+        return json.dumps({"success": False, "error": "No pending login. Call clerk_login first."}, indent=2)
+    try:
+        if clerk_session.complete_verification(code):
+            consumer = HiggsfieldConsumerClient(clerk_session)
+            auth_mode = "clerk"
+            return json.dumps({"success": True, "email": clerk_session.email, "message": "Verification complete, logged in"}, indent=2)
+        return json.dumps({"success": False, "error": "Verification failed. Check the code and try again."}, indent=2)
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
 
 
 # ===================================================================

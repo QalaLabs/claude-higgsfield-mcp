@@ -12,10 +12,10 @@ class HiggsfieldClient:
     def __init__(self, api_key: str, secret: str, base_url: str = "https://platform.higgsfield.ai"):
         self.base_url = base_url
         self.headers = {
-            "hf-api-key": api_key,
-            "hf-secret": secret,
+            "Authorization": f"Key {api_key}:{secret}",
             "Content-Type": "application/json",
             "Accept": "application/json",
+            "User-Agent": "higgsfield-server-js/2.0",
         }
 
     # ------------------------------------------------------------------

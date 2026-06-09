@@ -12,6 +12,7 @@ python = "^3.10"
 fastmcp = "^2.0.0"
 httpx = "^0.28.1"
 python-dotenv = "^1.0.0"
+curl-cffi = "^0.7.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.0.0"
