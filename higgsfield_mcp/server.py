@@ -9,7 +9,7 @@ import argparse
 from pathlib import Path
 from typing import Optional
 from dotenv import load_dotenv
-from fastmcp import FastMCP
+from fastmcp.server import FastMCP
 
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).parent.parent))
